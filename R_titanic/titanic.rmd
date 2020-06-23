@@ -1,0 +1,422 @@
+---
+title: "R for Titanic"
+author: "Matthew Wilson"
+date:  "`r Sys.Date()`"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  out.width = '\\textwidth',
+  fig.height = 5,
+  fig.width = 8,
+  warning = FALSE,
+  message = FALSE)
+```
+
+Necessary package and themes
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(skimr)
+library(ggsci)
+
+pal <- pal_jco(palette = c("default"), alpha = 1)(10)
+
+theme_set(theme_minimal())
+theme_update(axis.line.x = element_line(color="dark grey"),
+             axis.line.y = element_line(color="dark grey"))
+```
+
+
+##### loading the data
+
+```{r}
+train <- read_csv("./train.csv")
+test <- read_csv("./test.csv")
+```
+
+Preview the training data
+```{r}
+glimpse(train)
+```
+
+#### Select just the relevant features
+```{r}
+
+X <- bind_rows(train, test)
+
+X %>% 
+  mutate(Pclass = factor(Pclass),
+         Embarked = factor(Embarked),
+         Survived = factor(Survived),
+         Sex = factor(Sex))-> X
+
+features <- c('Pclass', 'Name', 'Sex', 'Age', 'SibSp', 'Parch', 'Fare', 'Embarked')
+
+X <- X %>% select(Survived, all_of(features))
+
+glimpse(X)
+
+```
+
+#### clean up `Name` feature to be smaller factor
+
+```{r paged.print=FALSE}
+
+
+X <- mutate(X, Title = str_sub(Name, str_locate(Name, ",")[,1] + 2, str_locate(Name, "\\.")[,1]-1))
+X$Title <- as_factor(X$Title)
+
+print(X %>% group_by(Title) %>% tally(sort = TRUE))
+```
+
+```{r}
+
+X <- X %>%
+          mutate(Title = fct_collapse(Title, "Miss" = c("Mlle", "Ms"), "Mrs" = "Mme", 
+                                      "Ranked" = c( "Major", "Dr", "Capt", "Col", "Rev"),
+                                      "Royalty" = c("Lady", "Dona", "the Countess", "Don", "Sir", "Jonkheer"))) 
+
+
+ggplot(X[1:891,], aes(x = Sex, fill = Survived)) +
+          geom_bar(position = "fill") +
+          ylab("Survival Rate") +
+          geom_hline(yintercept = sum(X[1:891,] %>% filter(Survived == 1) %>% 
+                                        group_by(Survived) %>% tally %>% 
+                                        select(n)) / nrow(X), col = "white", lty = 2) +
+          ggtitle("Survival Rate by Title")+
+          scale_fill_manual(values = pal)
+```
+
+#### create more factor variables alone status
+
+```{r}
+
+X <- X %>% mutate(Alone = factor(ifelse(SibSp + Parch < 1, "Yes", "No")))
+
+ggplot(X[1:891,], aes(x = Alone, fill = Survived))+
+          geom_bar(position = "fill")+
+          ylab("Survival Rate")+
+          geom_hline(yintercept = sum(X[1:891,] %>% filter(Survived == 1) %>% 
+                                        group_by(Survived) %>% tally %>% 
+                                        select(n)) / nrow(X),col = "white", lty = 2)+
+          facet_wrap(~Sex)+
+          ggtitle("Survival Rate by Solo Travel and Sex")+
+          scale_fill_manual(values = pal)
+
+
+```
+
+#### create more factor variables parent status
+
+```{r}
+
+X <- X %>% mutate(Parent = factor(ifelse(Parch > 0, "Yes", "No")))
+
+ggplot(X[1:891,], aes(x = Parent, fill = Survived))+
+          geom_bar(position = "fill")+
+          ylab("Survival Rate")+
+          geom_hline(yintercept = sum(X[1:891,] %>% filter(Survived == 1) %>% 
+                                        group_by(Survived) %>% tally %>% 
+                                        select(n)) / nrow(X),col = "white", lty = 2)+
+          facet_wrap(~Sex)+
+          ggtitle("Survival Rate by Parenting and Sex")+
+          scale_fill_manual(values = pal)
+
+```
+
+#### create more factor variables family size
+
+```{r}
+
+X <- X %>% mutate(FamilyType = factor(ifelse(Parch + SibSp + 1 > 4, "Large", 
+                                             ifelse(Parch + SibSp + 1 == 1, "Single", "Medium"))))
+
+ggplot(X[1:891,], aes(x = FamilyType, fill = Survived))+
+          geom_bar(position = "fill")+
+          ylab("Survival Rate")+
+          geom_hline(yintercept = sum(X[1:891,] %>% filter(Survived == 1) %>% 
+                                        group_by(Survived) %>% tally %>% 
+                                        select(n)) / nrow(X),col = "white", lty = 2)+
+          facet_wrap(~Sex)+
+          ggtitle("Survival Rate by Family Type")+
+          scale_fill_manual(values = pal)
+
+
+```
+
+#### Finalize the data for modeling , split apart train and test again 
+
+```{r}
+X <- X %>% select(-Name)
+X <- X %>% relocate(where(is.numeric)) #this is useful
+X <- X %>% relocate(Survived, .before = Age) #this is even more useful!
+
+X_test <- X %>% filter(is.na(Survived))
+X <- X %>% filter(!is.na(Survived))
+```
+
+
+## Modeling 
+
+#### Split training to test
+
+```{r}
+data_split <- initial_split(X, prop = .80)
+
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+train_data$Survived <- factor(train_data$Survived, labels = c("No", "Yes"))
+test_data$Survived <- factor(test_data$Survived, labels = c("No", "Yes"))
+X$Survived <- factor(X$Survived, labels = c("No", "Yes"))
+```
+
+
+#### preprocessing
+
+```{r}
+
+titanic_rec <- 
+  recipe(Survived ~ ., data = train_data) %>%
+  step_knnimpute(Embarked, Fare, Age, neighbors = 3) %>% 
+  step_dummy(all_nominal(), -all_outcomes()) %>% 
+  step_zv(all_predictors())
+
+titanic_prep <- prep(titanic_rec, training = train_data)
+
+#if you want to see the data preprocessed, nice that it returns a tibble!
+#titanic_juiced <- juice(titanic_prep)
+#titanic_bake <- bake(titanic_prep, new_data = train_data)
+
+test_bake <- bake(titanic_prep, new_data = test_data)
+
+```
+
+
+#### modeling
+
+```{r}
+
+rf_mod <-
+  rand_forest(mode = "classification") %>% 
+  set_engine("ranger")
+
+rf_fit <- rf_mod %>% 
+  fit(Survived ~ ., data = bake(titanic_prep, new_data = train_data))
+
+```
+
+
+```{r paged.print=FALSE}
+
+rf_testing_pred <- 
+  predict(rf_fit, test_bake) %>% 
+  bind_cols(predict(rf_fit, test_bake, type = "prob")) %>% 
+  bind_cols(test_bake %>% select(Survived))
+
+print(rf_testing_pred %>% accuracy(truth = Survived, .pred_class))
+print(rf_testing_pred %>% roc_auc(truth = Survived, .pred_Yes))
+
+```
+
+```{r}
+
+rf_testing_pred %>% 
+  roc_curve(truth = Survived, .pred_Yes) %>% 
+  autoplot()
+
+```
+
+```{r}
+
+cm <- rf_testing_pred %>% conf_mat(truth = Survived, .pred_class)
+autoplot(cm, type = "heatmap")
+
+
+```
+
+```{r paged.print=FALSE}
+print(summary(cm) %>% 
+        filter(.metric %in% c("accuracy", "kap", "recall", "precision", "f_meas")) %>% 
+        select(.metric, .estimate)) 
+```
+
+
+### Make Final Test Holdout Predictions 
+
+```{r}
+
+test_bake2 <- bake(titanic_prep, new_data = X_test)
+
+y_pred <- predict(rf_fit, test_bake2)
+y_pred$.pred_class <- as.numeric(y_pred$.pred_class) - 1
+
+#output <- bind_cols(test$PassengerId, y_pred) %>% rename("PassengerID" = "...1", "Survived" = ".pred_class")
+#write.csv(output,file = "output6_22.csv", row.names=FALSE)
+```
+
+## A more tidy way with workflow with tuning
+
+```{r}
+cores <- parallel::detectCores()
+
+rf_mod2 <-
+  rand_forest(mtry = tune(), min_n = tune(), trees = tune()) %>% 
+  set_engine("ranger", num.threads = cores) %>% 
+  set_mode("classification")
+
+
+rf_recipe <- 
+  recipe(Survived ~ ., data = train_data) %>%
+  step_knnimpute(Embarked, Fare, Age, neighbors = 3) %>% 
+  step_dummy(all_nominal(), -all_outcomes()) %>% 
+  step_zv(all_predictors())
+
+rf_workflow <-
+  workflow() %>%
+  add_model(rf_mod2) %>% 
+  add_recipe(rf_recipe)
+
+rf_mod2
+```
+
+```{r}
+rf_mod2 %>% 
+  parameters()
+```
+
+### Tune the model
+
+```{r paged.print=FALSE}
+set.seed(50)
+val_set <- validation_split(X, prop = 0.80)
+
+rf_res <- 
+  rf_workflow %>% 
+  tune_grid(val_set,
+            grid = 25,
+            control = control_grid(save_pred = TRUE),
+            metrics = metric_set(roc_auc))
+
+rf_res %>% 
+  show_best(metric = "roc_auc")
+
+```
+
+### Plot the tuning
+
+```{r}
+autoplot(rf_res)
+```
+
+### selecting the best model
+
+```{r paged.print=FALSE}
+
+rf_best <- 
+  rf_res %>% 
+  select_best(metric = "roc_auc")
+rf_best
+
+```
+
+
+```{r}
+
+rf_auc_1 <-
+rf_testing_pred %>% 
+  roc_curve(truth = Survived, .pred_Yes) %>% 
+  mutate(model = "non_tuned")
+
+# control_grid(save_pred = TRUE) so you can select the predictions
+rf_auc_2 <-
+rf_res %>% 
+  collect_predictions(parameters = rf_best) %>% 
+  roc_curve(truth = Survived, .pred_Yes) %>% 
+  mutate(model = "tuned")
+
+
+bind_rows(rf_auc_1, rf_auc_2) %>% 
+  ggplot(aes(x = 1 - specificity, y = sensitivity, col = model)) + 
+  geom_path(lwd = 1.5, alpha = 0.8) +
+  geom_abline(lty = 3) + 
+  coord_equal() + 
+  scale_color_manual(values = pal)
+
+```
+
+### building final model
+
+```{r paged.print=FALSE}
+
+last_rf_mod <- 
+  rand_forest(mtry = 8, min_n = 29, trees = 1435) %>% 
+  set_engine("ranger", num.threads = cores, importance = "impurity") %>% 
+  set_mode("classification")
+
+last_rf_workflow <- 
+  rf_workflow %>% 
+  update_model(last_rf_mod)
+
+set.seed(45)
+last_rf_fit <- 
+  last_rf_workflow %>% 
+  last_fit(data_split)
+
+last_rf_fit
+
+```
+
+
+This fitted workflow contains everything, including our final metrics based on the test set.
+
+```{r paged.print=FALSE}
+
+last_rf_fit %>% 
+  collect_metrics()
+
+
+```
+
+Access  variable importance scores via the .workflow column. We first need to pluck out the first element in the workflow column, then pull out the fit from the workflow object. Finally, the vip package helps us visualize the variable importance scores for the top 20 features:
+
+```{r}
+
+last_rf_fit %>% 
+  pluck(".workflow", 1) %>%   
+  pull_workflow_fit() %>% 
+  vip::vip(num_features = 20)
+
+```
+
+```{r}
+
+last_rf_fit %>% 
+  collect_predictions() %>% 
+  roc_curve(Survived, .pred_1) %>% 
+  autoplot()
+
+```
+
+#### Use the best parameters to fit the data and make predictions
+
+```{r}
+
+final_wf <-
+  rf_workflow %>% 
+  finalize_workflow(rf_best)
+
+final_rf <-
+  final_wf %>% 
+  fit(data = X)
+
+y_pred <- predict(final_rf, X_test)
+y_pred$.pred_class <- as.numeric(y_pred$.pred_class) - 1
+
+output <- bind_cols(test$PassengerId, y_pred) %>% rename("PassengerID" = "...1", "Survived" = ".pred_class")
+#write.csv(output,file = "output6_22.csv", row.names=FALSE)
+
+```
+
