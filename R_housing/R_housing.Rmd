@@ -1,0 +1,219 @@
+---
+title: "R for Kaggle Housing Competition"
+author: "Matthew Wilson"
+date:  "`r format(Sys.time(), '%d %B, %Y')`"
+output: github_document:
+          keep_html = TRUE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  out.width = '\\textwidth',
+  fig.height = 5,
+  fig.width = 8,
+  paged.print=FALSE,
+  warning = FALSE,
+  message = FALSE)
+```
+
+Necessary package and themes
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(skimr)
+library(ggsci)
+
+pal <- pal_jco(palette = c("default"), alpha = 1)(10)
+
+theme_set(theme_minimal())
+theme_update(axis.line.x = element_line(color="dark grey"),
+             axis.line.y = element_line(color="dark grey"))
+```
+
+### Kaggle Competition for Housing Prices (Regression)
+
+```{r paged.print=FALSE}
+
+housing_train <- read_csv("../../data/home_train.csv")
+housing_test <- read_csv("../../data/home_test.csv")
+glimpse(housing_train)
+```
+
+#### Check and remove outlier features with high frequency of NAs
+
+```{r}
+vapply(housing_train, function(x) mean(is.na(x)), c(num = 0))
+```
+
+```{r}
+col_nas <- tibble(feature = names(housing_train), 
+                  pct_na = vapply(housing_train, function(x) mean(is.na(x)), c(num = 0))) %>% 
+  arrange(desc(pct_na)) %>% 
+  filter(pct_na > .20)
+
+col_nas
+```
+
+```{r}
+#combine training and test and remove features with extreme NAs
+X <- bind_rows(housing_train, housing_test)
+X <- X %>% select(-one_of(col_nas$feature))
+```
+
+#### Look into correlations sales price
+
+```{r fig.height=7, fig.width=12}
+library(corrr)
+housing_cor <- housing_train %>% 
+                  select(where(is.numeric)) %>% 
+                  correlate() %>% 
+                  rearrange() %>% 
+                  shave()
+#head(fashion(housing_cor))
+
+rplot(housing_cor, print_cor = TRUE, shape = 20, colors = c(pal[1:2]))
+```
+
+#### identify columns for label encoding or one hot 
+Using dplyr look into columns with high cardinality and give a labeling by sorting on sale price, will not include in dummy variables
+
+```{r}
+col_cats <- housing_train %>% summarise(across(where(is.character), n_distinct)) %>% 
+  pivot_longer(everything(), names_to = 'feature', values_to = 'count') %>% 
+  arrange(desc(count)) %>% 
+  filter(count >= 10)
+
+label_enc <- col_cats$feature
+
+head(col_cats)
+```
+
+```{r}
+
+#take the high cardinality features and label encode in some kind of sensible
+for(i in label_enc){
+
+  X[[i]] <- as_factor(X[[i]],  ordered = TRUE)
+  X[[i]] <- fct_reorder(X[[i]], X$SalePrice, median, na.rm = TRUE, .desc = FALSE)
+  X[[i]] <- ordered(X[[i]], levels = levels(X[[i]]))
+  
+}
+
+#modify year to ordered factors
+for(i in names(X %>% select(contains(c("yr","year"))))) {
+
+X[[i]] <- as_factor(X[[i]])
+X[[i]]  <- ordered(X[[i]], levels = levels(X[[i]]))    
+  
+}
+
+label_enc <- c(label_enc, names(X %>% select(contains(c("yr","year")))))
+                
+
+```
+
+#### Create the model training set
+
+```{r}
+
+X <- X %>% select(-label_enc)
+
+
+X <- X %>% relocate(where(is.numeric))
+names(X) <- make.names(names(X))
+
+X_test <- X %>% filter(is.na(SalePrice))
+X <- X %>% filter(!is.na(SalePrice))
+
+X <- X %>%
+  mutate_if(sapply(X, is.character), as.factor)
+
+set.seed(19)
+data_split <- initial_split(X, prop = .80)
+
+X_train <- training(data_split)
+X_val <- testing(data_split)
+
+```
+
+
+
+```{r}
+
+housing_rec <- 
+  recipe(SalePrice ~ ., data = X_train) %>% 
+  update_role(Id, new_role = "id") %>%
+  step_knnimpute(all_predictors(), neighbors = 5) 
+  #step_ordinalscore(label_enc) %>% 
+  #step_normalize(all_numeric(), -all_outcomes(), -has_role("id")) %>% 
+  #step_dummy(all_nominal(), -all_outcomes()) %>% 
+  #step_corr(all_numeric(), -all_outcomes(),threshold = .80) %>% 
+  #step_zv(all_predictors())
+
+housing_prep <- prep(housing_rec, X_train)
+
+X_val_bake <- bake(housing_prep, new_data = X_val)
+
+
+```
+
+#### Model building
+
+```{r}
+rf_reg <-
+  rand_forest(mode = "regression") %>% 
+  set_engine("ranger")
+
+rf_fit <- rf_reg %>% 
+  fit(SalePrice ~ ., data = juice(housing_prep))
+
+house_pred <- 
+  predict(rf_fit, X_val_bake) %>% 
+  bind_cols(X_val_bake %>% select(SalePrice)) 
+
+mae(house_pred, SalePrice, .pred)
+
+```
+
+
+```{r}
+xg_reg <-
+    boost_tree() %>%
+    set_engine("xgboost") %>%
+    set_mode("regression")
+
+
+xg_res <- fit_resamples(
+  xg_reg,
+  housing_rec,
+  house_folds,
+  control = control_resamples(save_pred = TRUE)
+  )
+
+xg_res %>% unnest(.predictions) %>% metrics(truth = SalePrice, estimate = .pred)
+
+```
+
+
+#### Cross fold validation
+
+```{r paged.print=FALSE}
+
+house_folds <- vfold_cv(X_train, v = 5)
+
+rf_res <- fit_resamples(
+  rf_reg,
+  housing_rec,
+  house_folds,
+  control = control_resamples(save_pred = TRUE)
+  )
+
+rf_res %>% unnest(.predictions) %>% metrics(truth = SalePrice, estimate = .pred)
+
+rf_res %>% 
+  collect_metrics()
+
+# or just check other metrics
+rf_res %>% unnest(.predictions) %>% group_by(id) %>% mae(SalePrice, .pred)
+
+```

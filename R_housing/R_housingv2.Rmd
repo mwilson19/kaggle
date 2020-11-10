@@ -1,0 +1,457 @@
+---
+title: "R v2 for Kaggle Housing Competition"
+author: "Matthew Wilson"
+date:  "`r format(Sys.time(), '%d %B, %Y')`"
+output: github_document:
+          keep_html = TRUE
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(
+  out.width = '\\textwidth',
+  fig.height = 5,
+  fig.width = 8,
+  paged.print=FALSE,
+  warning = TRUE,
+  message = FALSE)
+
+```
+
+Necessary package and themes
+```{r}
+
+library(tidyverse)
+library(tidymodels)
+library(skimr)
+library(ggsci)
+library(janitor)
+
+pal <- pal_jco(palette = c("default"), alpha = 1)(10)
+
+theme_set(theme_minimal())
+theme_update(axis.line.x = element_line(color="dark grey"),
+             axis.line.y = element_line(color="dark grey"))
+
+```
+
+### Kaggle Competition for Housing Prices (Regression)
+
+```{r paged.print=FALSE}
+
+housing_train <- clean_names(read_csv("../../data/home_train.csv"))
+housing_test <- clean_names(read_csv("../../data/home_test.csv"))
+glimpse(housing_train)
+
+```
+
+
+```{r}
+#great way to see na percent of each column
+vapply(housing_train, function(x) mean(is.na(x)), c(num = 0))
+
+```
+
+```{r fig.height=7, fig.width=13}
+library(visdat)
+vis_miss(housing_train, cluster = TRUE)+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+```
+
+
+
+```{r paged.print=FALSE}
+
+col_nas <- tibble(feature = names(housing_train), 
+                  pct_na = vapply(housing_train, function(x) mean(is.na(x)), c(num = 0))) %>% 
+  arrange(desc(pct_na)) %>% 
+  filter(pct_na < .15)
+
+col_nas_rm <- col_nas$feature
+
+col_nas
+
+```
+
+```{r fig.height=7, fig.width=12}
+
+library(corrr)
+housing_cor <- housing_train %>% 
+                  select(where(is.numeric), -id) %>% 
+                  correlate() %>% 
+                  rearrange() %>% 
+                  shave()
+
+#fashion(housing_cor)
+
+rplot(housing_cor, print_cor = TRUE, shape = 20)+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+```
+
+```{r}
+
+housing_train %>%  
+        select(where(is.numeric), -id) %>% 
+        correlate() %>%  
+        focus(sale_price) %>% 
+        mutate(rowname = reorder(rowname, sale_price)) %>%
+        ggplot(aes(rowname, sale_price)) +
+        geom_col() + coord_flip()
+
+```
+
+
+#### identify columns for label encoding or one hot  
+Using dplyr look into columns with high cardinality and give a labeling by sorting on sale price, will not include in dummy variables
+
+```{r}
+
+col_cats <- housing_train %>% summarise(across(where(is.character), n_distinct)) %>% 
+  pivot_longer(everything(), names_to = 'feature', values_to = 'count') %>% 
+  arrange(desc(count)) %>% 
+  filter(count >= 10)
+
+label_enc <- col_cats$feature
+
+head(col_cats)
+
+```
+
+```{r}
+
+housing_train %>% 
+  ggplot(aes(fct_infreq(neighborhood)))+
+  geom_bar() + coord_flip()
+    
+```
+
+### Outlier issues
+
+```{r}
+
+housing_train %>%
+  ggplot(aes(x = gr_liv_area, y = sale_price)) +
+  geom_point(alpha = 0.75, color=pal[1]) +
+  scale_y_continuous(breaks= seq(0, 800000, by=200000), labels = scales::comma) +
+  labs(x = "Above ground living area", y = "Sale Price", title = "Sale Price by Above Ground Living Area")
+
+```
+
+```{r}
+#remove huge outliers
+
+housing_train <-
+  housing_train %>% 
+  filter(!(gr_liv_area > 4000 & sale_price < 200000))
+
+```
+
+
+
+### initial data split
+
+```{r}
+#resample
+
+set.seed(19)
+data_split <- initial_split(housing_train, 
+                            prop = .80,
+                            strata = sale_price)
+
+X_train <- training(data_split)
+X_test <- testing(data_split)
+
+```
+
+
+### preprocessing
+
+  - Filter out zero or near-zero variance features.
+  - Perform imputation if required.
+  - Normalize to resolve numeric feature skewness.
+  - Standardize (center and scale) numeric features.
+  - Perform dimension reduction (e.g., PCA) on numeric features.
+  - One-hot or dummy encode categorical features
+
+```{r}
+#recipes
+
+xgb_recipe <- 
+  recipe(sale_price ~ ., data = X_train) %>% 
+  update_role(id, new_role = "id") %>%
+  step_nzv(all_nominal()) %>% 
+  step_log(all_outcomes(), skip = TRUE) %>% 
+  step_string2factor(all_nominal(), -all_outcomes()) %>%  
+  step_unknown(matches("bsmt|garage|mas"),-all_numeric(), new_level = "other") %>% 
+  step_mutate_at(matches("bsmt|garage|mas"), -all_nominal(), fn = ~ tidyr::replace_na(., 0)) %>% 
+  step_knnimpute(all_predictors(), neighbors = 6) %>%
+  step_other(screen_porch, threshold = .1, other = ">0") %>% 
+  step_integer(matches("qual|qc|qu|cond"), -overall_qual,-overall_cond) %>% 
+  step_other(neighborhood, threshold = 0.01) %>% 
+  step_mutate(
+    total_sf = total_bsmt_sf + x1st_flr_sf + x2nd_flr_sf,
+    avg_rm_sf = gr_liv_area / tot_rms_abv_grd,
+    total_baths = bsmt_full_bath + (bsmt_half_bath * 0.5) + full_bath + (half_bath * 0.5),
+    age = yr_sold - year_built,
+    new = forcats::as_factor(if_else(yr_sold == year_built, 1, 0)),
+    old = forcats::as_factor(if_else(year_built < 1940, 1, 0)),
+    pool = forcats::as_factor(if_else(pool_area > 0, 1, 0)),
+    basement = forcats::as_factor(if_else(total_bsmt_sf > 0, 1, 0)),
+    garage = forcats::as_factor(if_else(garage_area > 0, 1, 0)),
+    remodeled = forcats::as_factor(if_else(year_remod_add > year_built, 1, 0))
+    ) %>%
+  step_normalize(all_numeric(), -all_outcomes(), -has_role("id")) %>% 
+  step_dummy(all_nominal(), -all_outcomes(), one_hot = TRUE)
+
+
+#step_pca(all_numeric(), -all_outcomes(), threshold = .95) %>% 
+#step_BoxCox(-all_outcomes()) %>%
+#step_corr(all_numeric(), -all_outcomes(),threshold = .90)
+
+```
+
+### quick validation on best preprocessing before moving further
+
+```{r}
+recipe(sale_price ~ ., data = X_train) %>%
+  step_mutate_at(matches("bsmt|garage|mas"), -all_nominal(), fn = ~ replace_na(., 0)) %>% 
+  prep(X_train) %>%
+  bake(X_train) %>%
+  summarize(test = mean(is.na(mas_vnr_area)))
+```
+
+
+```{r}
+
+xgb_spec <- boost_tree(
+      trees = 1000,
+      min_n = 25,
+      tree_depth = 10,
+      learn_rate = 0.007,
+      loss_reduction = 3.06673510485747e-08
+      ) %>% 
+  set_engine("xgboost", objective = 'reg:squarederror') %>% 
+  set_mode('regression')
+
+
+set.seed(19)
+folds <- vfold_cv(X_train, strata = sale_price, v = 5)
+
+xgb_results <- xgb_spec %>% 
+  fit_resamples(
+    preprocessor = xgb_recipe,
+    resamples = folds,
+    metrics = metric_set(rmse, rsq, mae),
+    control = control_resamples(save_pred = TRUE)
+    )
+  
+xgb_results %>% unnest(.predictions) %>% 
+  mutate(.pred = exp(.pred), sale_price = exp(sale_price)) %>% 
+  metrics(sale_price, .pred)
+
+```
+
+### model spec for XGBoost tuning
+
+```{r}
+#parsnip and tune
+
+xgb_model <-
+    boost_tree(
+      mode = 'regression',
+      trees = 1000,
+      min_n = tune(),
+      tree_depth = tune(),
+      learn_rate = tune(),
+      loss_reduction = tune(),
+    ) %>% 
+    set_engine('xgboost', objective = 'reg:squarederror')
+
+```
+
+
+### grid spec parameters
+
+```{r}
+#dials
+
+xgb_params <-
+  parameters(
+    min_n(),
+    tree_depth(),
+    learn_rate(),
+    loss_reduction()
+    )
+
+xgb_grid <- grid_latin_hypercube(
+  xgb_params, 
+  size = 25
+)
+
+xgb_grid
+
+```
+
+### setup Workflow
+
+```{r}
+
+xgb_wf <- 
+  workflow() %>%
+  add_model(xgb_model) %>% 
+  add_recipe(xgb_recipe)
+
+```
+
+### hyperparameter tuning
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+
+# speed up computation with parrallel processing
+
+all_cores <- parallel::detectCores(logical = FALSE)
+
+library(doParallel)
+cl <- makePSOCKcluster(all_cores)
+registerDoParallel(cl)
+
+clusterEvalQ(cl, {library(tidymodels)})
+
+```
+
+
+```{r}
+
+# tune resample set
+set.seed(19)
+folds <- vfold_cv(X_train, strata = sale_price, v = 3)
+
+xgb_tuned <- tune_grid(
+  xgb_wf,
+  resamples = folds,
+  grid = xgb_grid,
+  metrics = metric_set(rmse, rsq, mae),
+  control = control_grid(save_pred = TRUE)
+)
+
+```
+
+```{r}
+
+#top 5 best hyperparamaters
+xgb_tuned %>% show_best(metric = "rmse")
+
+```
+
+
+```{r}
+
+#best hyperparamaters
+xgb_best_params <- xgb_tuned %>% select_best(metric = "rmse")
+
+xgb_best_params
+
+```
+
+```{r}
+#create model with best tuning parameters
+
+xgb_model_final <- xgb_model %>% 
+  finalize_model(xgb_best_params)
+
+```
+
+### evaluate Performance
+
+```{r}
+#training evaluation
+
+#update the wofklow
+xgb_wf <- update_model(xgb_wf, xgb_model_final)
+
+#create cv folds
+train_folds <- vfold_cv(X_train, v = 5, strata = sale_price)
+
+#resample
+xgb_cv <- fit_resamples(
+  xgb_wf,
+  resamples = train_folds,
+  metrics = metric_set(rmse, rsq, mae),
+  control = control_resamples(save_pred = TRUE)
+  )
+
+xgb_cv %>% unnest(.predictions) %>% metrics(sale_price, .pred)
+
+```
+
+```{r}
+library(vip)
+
+feat_imp <-
+  xgb_wf %>%
+    fit(data = X_train) %>%
+    pull_workflow_fit() 
+
+feat_imp %>% 
+  vip(geom = 'col', aesthetics = list(fill = pal[1]))
+
+#vi(feat_imp)
+```
+
+
+
+```{r warning=FALSE}
+
+xgb_fit_workflow <- 
+  xgb_wf %>% 
+  fit(data = X_train)
+
+# test set
+test_prediction <-
+    xgb_fit_workflow %>% 
+    predict(X_test) %>% 
+    bind_cols(X_test) %>% 
+    mutate(.pred = exp(.pred))
+
+test_prediction %>%  metrics(sale_price, .pred)
+
+```
+
+
+### plot residuals
+
+```{r}
+
+test_prediction %>%
+  arrange(.pred) %>%
+  mutate(residual_pct = (sale_price - .pred) / .pred) %>%
+  select(.pred, residual_pct) %>% 
+ggplot(aes(x = .pred, y = residual_pct)) +
+  geom_point(color = pal[1]) +
+  xlab("Predicted Sale Price") +
+  ylab("Residual (%)") +
+  scale_x_continuous(labels = scales::dollar_format()) +
+  scale_y_continuous(labels = scales::percent)
+
+```
+
+### create final output for kaggle submission
+
+```{r}
+
+final_prediction <-
+  xgb_fit_workflow %>% 
+    predict(housing_test) %>% 
+    bind_cols(housing_test) %>% 
+    mutate(.pred = exp(.pred))
+
+output <- final_prediction %>% 
+  rename(Id = id, SalePrice = .pred) %>% 
+  select(Id, SalePrice)
+
+write.csv(output,file = "output7_6.csv", row.names=FALSE)
+```
+
+

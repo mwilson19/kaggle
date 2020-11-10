@@ -1,0 +1,678 @@
+---
+title: "R v2 Titanic"
+author: "Matthew Wilson"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  github_document: default
+  html_document: github_document
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(
+  out.width = '\\textwidth',
+  fig.height = 5,
+  fig.width = 8,
+  paged.print=FALSE,
+  warning = TRUE,
+  message = FALSE)
+
+```
+
+```{python include=FALSE}
+import os
+os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = 'C:/Users/mwilson/AppData/Local/Continuum/miniconda3/Library/plugins/platforms'
+```
+
+
+
+#### Necessary package and themes
+
+```{r}
+
+library(tidyverse)
+library(tidymodels)
+library(skimr)
+library(janitor)
+library(corrr)
+library(vip)
+library(visdat)
+
+pal <- c("#0073C2FF","#EFC000FF","#868686FF","#CD534CFF","#7AA6DCFF",
+         "#003C67FF","#8F7700FF","#3B3B3BFF","#A73030FF","#4A6990FF")
+
+theme_set(theme_minimal())
+theme_update(axis.line.x = element_line(color="dark grey"),
+             axis.line.y = element_line(color="dark grey"))
+
+library(reticulate)
+
+```
+
+### Kaggle Competition for Housing Prices (Regression)
+
+```{r paged.print=FALSE}
+
+train <- clean_names(read_csv("../../data/train.csv"))
+test <- clean_names(read_csv("../../data/test.csv"))
+glimpse(train)
+
+```
+
+#### Check for missing values for impute steps
+
+```{r fig.height=7, fig.width=13}
+
+vis_miss(train, cluster = TRUE)+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+```
+
+#### Check any confounding imputation on fare basd on pclass or embarked
+
+```{python}
+
+#check if any hierarch with pclass and embarked
+r.train.pivot_table(index=['embarked','pclass'], columns='survived', values='fare', aggfunc='median', margins = True)
+
+```
+
+```{python}
+
+#check if any hierarch with pclass and embarked
+r.train.groupby('embarked').fare.median().sort_values()
+
+```
+
+```{r}
+
+train %>% group_by(embarked,survived) %>% tally() %>% mutate(pct = n / sum(n))
+
+```
+
+#### Fare is really skewed right
+
+```{r}
+
+#print(train %>% select(survived, fare) %>% group_by(survived) %>% skim())
+ggplot(train, aes(x=fare))+
+  geom_histogram()
+
+```
+
+### initial data split
+
+```{r}
+#resample
+train$survived <- factor(train$survived, labels = c("No", "Yes"))
+
+set.seed(19)
+data_split <- initial_split(train, 
+                            prop = .80,
+                            strata = survived)
+
+X_train <- training(data_split)
+X_test <- testing(data_split)
+
+```
+
+#### preprocessing
+
+```{r}
+
+xgb_recipe <- 
+  recipe(survived ~ ., data = X_train) %>%
+  update_role(passenger_id, new_role = "id") %>%
+  step_nzv(all_nominal()) %>%
+  step_mutate(title = str_sub(name, str_locate(name, ",")[,1] + 2, str_locate(name, "\\.")[,1]-1)) %>% 
+  step_other(title, threshold = .03) %>% 
+  step_mutate(
+    alone = as_factor(ifelse(sib_sp + parch < 1, "Yes", "No")),
+    parent = as_factor(ifelse(parch > 0, "Yes", "No")),
+    familytype = as_factor(ifelse(parch + sib_sp + 1 > 4, "Large", 
+                       ifelse(parch + sib_sp + 1 == 1, "Single", "Medium"))),
+    fare_range = ntile(fare,5),
+    age_range =  ntile(age,4)) %>% 
+  step_rm(name, cabin, ticket) %>% 
+  step_mutate(fare = ifelse(fare > 100, 100, fare)) %>% 
+  step_string2factor(all_nominal(), -all_outcomes()) %>%
+  step_bagimpute(all_predictors(), -all_outcomes()) %>% 
+  step_normalize(all_numeric(), -all_outcomes(), -has_role("id")) %>% 
+  step_dummy(all_nominal(), -all_outcomes(), one_hot = TRUE) %>% 
+  step_corr(all_numeric(), -all_outcomes(),threshold = .80)
+
+
+```
+#### Cross check basic xgb model
+
+```{r}
+
+xgb_init <- boost_tree(
+      trees = 1000,
+      min_n = 25,
+      tree_depth = 10,
+      learn_rate = 0.007,
+      loss_reduction = 3.06673510485747e-08
+      ) %>% 
+  set_engine("xgboost") %>% 
+  set_mode('classification')
+
+xgb_wf <- 
+  workflow() %>%
+  add_model(xgb_init) %>% 
+  add_recipe(xgb_recipe)
+
+set.seed(19)
+folds <- vfold_cv(X_train, strata = survived, v = 3)
+
+xgb_results <- fit_resamples(
+    xgb_wf,
+    folds,
+    metrics = metric_set(roc_auc, pr_auc, accuracy, f_meas),
+    control = control_resamples(save_pred = TRUE)
+    )
+  
+#baseline model results
+xgb_results %>% collect_metrics()
+
+```
+
+```{r}
+
+#check it on the test
+xgb_trained <- 
+  xgb_wf %>% 
+  fit(X_train)
+
+xgb_trained %>% 
+  predict(X_test) %>% 
+  bind_cols(select(X_test,survived)) %>% 
+  metrics(survived, .pred_class)
+
+```
+
+## model spec for XGBoost tuning
+
+```{r}
+#parsnip and tune
+
+xgb_model <-
+    boost_tree(
+      mode = 'classification',
+      trees = 1000,
+      min_n = tune(),
+      tree_depth = tune(),
+      learn_rate = tune(),
+      loss_reduction = tune()
+    ) %>% 
+    set_engine('xgboost')
+
+```
+
+
+### grid spec parameters
+
+```{r}
+#dials
+
+xgb_params <-
+  parameters(
+    min_n(),
+    tree_depth(),
+    learn_rate(),
+    loss_reduction())
+
+xgb_grid <- grid_latin_hypercube(
+    xgb_params,
+    size = 15
+)
+
+xgb_grid
+
+```
+
+### hyperparameter tuning
+
+```{r}
+
+xgb_wf <- update_model(xgb_wf, xgb_model)
+
+# tune resample set
+set.seed(19)
+folds <- vfold_cv(X_train, strata = survived, v = 3)
+
+xgb_tuned <- tune_grid(
+  xgb_wf,
+  resamples = folds,
+  grid = xgb_grid,
+  metrics = metric_set(roc_auc, pr_auc, accuracy, f_meas),
+  control = control_grid(save_pred = TRUE)
+)
+
+```
+
+```{r}
+
+#top 5 best hyperparamaters
+xgb_tuned %>%  show_best(metric = "accuracy")
+
+```
+
+
+### Select best hyperparamters
+
+```{r}
+#create model with best tuning parameters
+#best hyperparamaters
+xgb_best_params <- xgb_tuned %>% select_best(metric = "accuracy")
+xgb_model_final <- xgb_model %>% finalize_model(xgb_best_params)
+
+#update the wofklow
+xgb_wf <- update_model(xgb_wf, xgb_model_final)
+
+```
+
+#### Evaluate performance
+
+```{r}
+set.seed(19)
+folds <- vfold_cv(X_train, strata = survived, v = 5)
+
+xgb_results <- fit_resamples(
+    xgb_wf,
+    folds,
+    metrics = metric_set(roc_auc, pr_auc, accuracy, f_meas),
+    control = control_resamples(save_pred = TRUE)
+    )
+  
+#baseline model results
+xgb_results %>% collect_metrics()
+```
+
+#### Final validation on holdout test
+
+```{r}
+
+xgb_wf <- update_recipe(xgb_wf, xgb_recipe)
+
+#check it on the test
+xgb_trained <- 
+  xgb_wf %>% 
+  fit(X_train)
+
+
+xgb_trained %>% 
+    predict(X_test) %>% 
+    bind_cols(select(X_test, survived)) %>% 
+    metrics(survived, .pred_class)
+
+```
+
+### ROC Curve
+
+```{r}
+
+xgb_trained %>% 
+    predict(X_test, type = "prob") %>% 
+    bind_cols(select(X_test, survived)) %>% 
+    roc_curve(survived, .pred_Yes) %>%
+    autoplot()
+  
+```
+
+```{r}
+
+xgb_trained %>% 
+    predict(X_test) %>% 
+    bind_cols(select(X_test, survived)) %>% 
+    conf_mat(truth = survived, .pred_class) %>% 
+    autoplot(type = "heatmap")
+
+```
+#### Feature importance
+
+```{r}
+
+xgb_trained %>%  
+  pull_workflow_fit() %>% 
+  vip(num_features = 20)
+
+```
+
+
+## Other model considerations
+
+####  logistic regression
+
+```{r}
+lg_model <-
+logistic_reg() %>% 
+  set_engine("glm") %>% 
+  set_mode("classification")
+
+lg_wf <- update_model(xgb_wf, lg_model)
+
+
+#check it on the test
+lg_trained <- 
+  lg_wf %>% 
+  fit(X_train)
+
+lg_trained %>% 
+  predict(X_test) %>% 
+  bind_cols(select(X_test,survived)) %>% 
+  metrics(survived, .pred_class)
+
+```
+
+####  random forest
+
+```{r}
+
+rf_model <-
+rand_forest(mtry = 8,
+            min_n = 30,
+            trees = 1500) %>% 
+  set_engine("ranger") %>% 
+  set_mode("classification")
+
+rf_wf <- update_model(xgb_wf, rf_model)
+
+
+#check it on the test
+rf_trained <- 
+  rf_wf %>% 
+  fit(X_train)
+
+rf_trained %>% 
+  predict(X_test) %>% 
+  bind_cols(select(X_test,survived)) %>% 
+  metrics(survived, .pred_class)
+
+```
+
+
+####  support vector machine
+
+```{r}
+
+sv_model <-
+svm_rbf() %>% 
+  set_engine("kernlab") %>% 
+  set_mode("classification")
+  
+sv_wf <- update_model(xgb_wf, sv_model)
+
+
+#check it on the test
+sv_trained <- 
+  sv_wf %>% 
+  fit(X_train)
+
+sv_trained %>% 
+  predict(X_test) %>% 
+  bind_cols(select(X_test,survived)) %>% 
+  metrics(survived, .pred_class)
+
+```
+
+
+####  K-nearest neighbor
+
+```{r}
+
+knn_model <-
+nearest_neighbor() %>% 
+  set_engine("kknn") %>% 
+  set_mode("classification")
+
+knn_wf <- update_model(xgb_wf, knn_model)
+
+
+#check it on the test
+knn_trained <- 
+  knn_wf %>% 
+  fit(X_train)
+
+knn_trained %>% 
+  predict(X_test) %>% 
+  bind_cols(select(X_test,survived)) %>% 
+  metrics(survived, .pred_class)
+
+```
+
+####  Neural net with multi layer perceptron
+
+```{r}
+
+mlp_model <-
+  mlp(penalty = 0.01,
+      hidden_units = 1,
+      epochs = 100) %>% 
+  set_engine("nnet") %>% 
+  set_mode("classification")
+
+mlp_wf <- update_model(xgb_wf, mlp_model)
+
+
+#check it on the test
+mlp_trained <- 
+  mlp_wf %>% 
+  fit(X_train)
+
+mlp_trained %>% 
+  predict(X_test) %>% 
+  bind_cols(select(X_test,survived)) %>% 
+  metrics(survived, .pred_class)
+
+```
+
+#### Use the best parameters to fit the data and make predictions
+
+```{r}
+
+y_pred <- predict(xgb_trained, test)
+y_pred$.pred_class <- as.numeric(y_pred$.pred_class) - 1
+
+output <- bind_cols(test$passenger_id, y_pred) %>% rename("PassengerID" = "...1","survived" = ".pred_class")
+write.csv(output,file = "output7_16.csv", row.names=FALSE)
+
+```
+
+
+## lightGBM example mix/match between R and Python
+
+#### r preprocessing 
+
+```{r}
+
+train <- clean_names(read_csv("../../data/train.csv"))
+
+lightGBM_recipe <- 
+  recipe(survived ~ ., data = train) %>%
+  step_rm(passenger_id) %>% 
+  step_nzv(all_nominal()) %>%
+  step_mutate(title = str_sub(name, str_locate(name, ",")[,1] + 2, str_locate(name, "\\.")[,1]-1)) %>% 
+  step_other(title, threshold = .03) %>% 
+  step_mutate(
+    alone = as_factor(ifelse(sib_sp + parch < 1, "Yes", "No")),
+    parent = as_factor(ifelse(parch > 0, "Yes", "No")),
+    familytype = as_factor(ifelse(parch + sib_sp + 1 > 4, "Large", 
+                       ifelse(parch + sib_sp + 1 == 1, "Single", "Medium"))),
+    fare_range = ntile(fare,5),
+    age_range =  ntile(age,4)) %>% 
+  step_rm(name, cabin, ticket) %>% 
+  step_mutate(fare = ifelse(fare > 100, NA, fare)) %>% 
+  step_string2factor(all_nominal(), -all_outcomes()) %>%
+  step_bagimpute(all_predictors(),-all_outcomes()) %>% 
+  step_dummy(all_nominal(), -all_outcomes(), one_hot = TRUE) %>% 
+  step_corr(all_numeric(), -all_outcomes(),threshold = .95) %>% 
+  prep()
+
+baked_gbm <- bake(lightGBM_recipe, train)
+test_baked_gbm <- bake(lightGBM_recipe, test)
+
+```
+
+
+#### import python modules
+
+```{python}
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import lightgbm as lgbm
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import accuracy_score, recall_score, precision_score, f1_score
+
+r.baked_gbm.info()
+
+```
+
+
+#### Create splits
+
+```{python}
+X = r.baked_gbm
+y = X.pop('survived')
+
+# Take a hold out set randomly
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+
+# training
+train_data = lgbm.Dataset(data=X_train, label=y_train, free_raw_data=False)
+
+# test
+test_data = lgbm.Dataset(data=X_test, label=y_test, free_raw_data=False)
+
+# FULL training
+final_train_set = lgbm.Dataset(data=X, label=y, free_raw_data=False)
+
+```
+
+
+```{python}
+
+fit_params={"early_stopping_rounds":10, 
+            "eval_metric" : 'auc', 
+            "eval_set" : [(X_test,y_test)],
+            'eval_names': ['valid'],
+            'verbose': 100,
+            'feature_name': 'auto', # that's actually the default
+            'categorical_feature': 'auto' # that's actually the default
+           }
+
+
+clf = lgbm.LGBMClassifier(num_leaves= 15, max_depth=-1, 
+                         random_state=314, 
+                         silent=True, 
+                         metric='None', 
+                         n_jobs=4, 
+                         n_estimators=1000,
+                         colsample_bytree=0.9,
+                         subsample=0.9,
+                         learning_rate=0.1)
+                         
+clf.fit(X_train, y_train, **fit_params)
+
+```
+
+```{python}
+feat_imp = pd.Series(clf.feature_importances_, index=X.columns)
+feat_imp.nlargest(10).plot(kind='bar', figsize=(8,5))
+plt.show()
+```
+
+```{python}
+
+preds = clf.predict(X_test)
+print('Accuracy score = \t {}'.format(accuracy_score(y_test, preds)))
+print('Precision score = \t {}'.format(precision_score(y_test, preds)))
+print('Recall score =   \t {}'.format(recall_score(y_test, preds)))
+print('F1 score =      \t {}'.format(f1_score(y_test, preds)))
+
+```
+
+```{python}
+
+lgbm_params = {
+    'boosting': 'gbrt',          # dart (drop out trees) often performs better
+    'application': 'binary',     # Binary classification
+    'learning_rate': 0.05,       # Learning rate, controls size of a gradient descent step
+    'min_data_in_leaf': 20,      # Data set is quite small so reduce this a bit
+    'feature_fraction': 0.7,     # Proportion of features in each boost, controls overfitting
+    'num_leaves': 41,            # Controls size of tree since LGBM uses leaf wise splits
+    'metric': 'binary_logloss',  # Area under ROC curve as the evaulation metric
+    'drop_rate': 0.15
+              }
+
+evaluation_results = {}
+clf2 = lgbm.train(train_set=train_data,
+                 params=lgbm_params,
+                 valid_sets=[train_data, test_data], 
+                 valid_names=['Train', 'Test'],
+                 evals_result=evaluation_results,
+                 num_boost_round=500,
+                 early_stopping_rounds=100,
+                 verbose_eval=20
+                )
+optimum_boost_rounds = clf2.best_iteration
+```
+
+```{python}
+fig, axs = plt.subplots(1, 2, figsize=[15, 4])
+
+# Plot the log loss during training
+axs[0].plot(evaluation_results['Train']['binary_logloss'], label='Train')
+axs[0].plot(evaluation_results['Test']['binary_logloss'], label='Test')
+axs[0].set_ylabel('Log loss')
+axs[0].set_xlabel('Boosting round')
+axs[0].set_title('Training performance')
+axs[0].legend()
+
+# Plot feature importance
+importances = pd.DataFrame({'features': clf2.feature_name(), 
+                            'importance': clf2.feature_importance()}).sort_values('importance', ascending=False)
+axs[1].bar(x=np.arange(len(importances)), height=importances['importance'])
+axs[1].set_xticks(np.arange(len(importances)))
+axs[1].set_xticklabels(importances['features'])
+axs[1].set_ylabel('Feature importance (# times used to split)')
+axs[1].set_title('Feature importance')
+
+plt.show()
+```
+```{python}
+
+preds = np.round(clf2.predict(X_test))
+print('Accuracy score = \t {}'.format(accuracy_score(y_test, preds)))
+print('Precision score = \t {}'.format(precision_score(y_test, preds)))
+print('Recall score =   \t {}'.format(recall_score(y_test, preds)))
+print('F1 score =      \t {}'.format(f1_score(y_test, preds)))
+```
+
+```{python}
+
+clf_final = lgbm.train(train_set=final_train_set,
+                      params=lgbm_params,
+                      num_boost_round=optimum_boost_rounds,
+                      verbose_eval=0
+                      )
+
+y_pred = np.round(clf_final.predict(r.test_baked_gbm)).astype(int)
+
+```
+
+
+```{python}
+output = pd.DataFrame({'PassengerId': r.test['passenger_id'], 'Survived': y_pred})
+output.head()
+```
+
+```{r}
+write.csv(py$output,file = "output_gbm.csv", row.names=FALSE)
+```
+
+
+
